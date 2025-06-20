@@ -1,1 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environment
+venv/
+
+# Models and raw audio
+models/
+raw_audio/
+
+# Editor/IDE files
+*.swp
+*.sublime-workspace
+
+# pyenv
+.python-version
+
+# MacOS annoyance
 .DS_STORE

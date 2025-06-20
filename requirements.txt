@@ -1,1 +1,22 @@
-openai-whisper
+# Core audio I/O & DSP
+numpy>=1.21.0
+soundfile>=0.12.1
+
+# Audio format conversion (requires system-level ffmpeg installed)
+ffmpeg-python>=0.2.0
+
+# ASR & LID
+torch>=1.12.0
+openai-whisper>=1.1.10
+
+# CLI framework
+click>=8.0.0
+
+# (Optional) lightweight text-based LID fallback
+# pycld3>=0.22.0,<0.23.0
+
+# (Optional) Voice Activity Detection
+webrtcvad>=2.0.10
+
+# Packaging
+setuptools>=65.0.0
