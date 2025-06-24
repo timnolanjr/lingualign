@@ -1,180 +1,126 @@
 # lingualign/lid.py
+
 """
-Sliding-window language identification (LID) for Lingualign.
-Segments bilingual (English/Spanish) audio into labeled spans.
+Language Identification (LID) utilities using SpeechBrain ECAPA-TDNN.
+
+This module provides functions to:
+  - load a pretrained ECAPA-TDNN language ID model
+  - classify individual audio segments as English vs. Spanish
+  - process VAD segments end-to-end
 """
+
 import numpy as np
 import torch
-import whisper
-from typing import List, Tuple
+from speechbrain.inference.classifiers import EncoderClassifier
 
-# Initialize Whisper model for language identification
-device = "cuda" if torch.cuda.is_available() else "cpu"
-_model = whisper.load_model("base").to(device)
+from .vad import get_speech_turns
+from .io import load_and_normalize
+
+# Load ECAPA-TDNN VoxLingua107 LID model once at import
+LANG_ID = EncoderClassifier.from_hparams(
+    source="speechbrain/lang-id-voxlingua107-ecapa",
+    savedir="pretrained_models/lang-id-voxlingua107-ecapa",
+)
+
+# Suppress the “expect_len” warning if it appears
+try:
+    LANG_ID.hparams.label_encoder.ignore_len()
+except Exception:
+    pass
 
 
-def slide_windows(
+def classify_segment(
     audio: np.ndarray,
-    sr: int,
-    window_size: float,
-    hop_size: float
-) -> List[np.ndarray]:
+    sr: int = 16000,
+    min_duration: float = 0.5
+) -> (str, float):
     """
-    Slice audio into overlapping windows.
+    Classify a raw audio segment as English ('en') or Spanish ('es').
+
+    Pads very short segments, runs the ECAPA-TDNN model, and
+    maps the predicted language to either 'en' or 'es'.
 
     Args:
-        audio: 1-D float32 array of audio samples.
-        sr: Sample rate (e.g., 16000).
-        window_size: Window length in seconds.
-        hop_size: Hop length in seconds.
+        audio: 1-D numpy array of float32 samples at `sr`
+        sr: sampling rate (default: 16000)
+        min_duration: minimum segment length in seconds; pad if shorter
 
     Returns:
-        List of audio windows as numpy arrays.
+        iso_code: 'en' or 'es'
+        confidence: float probability between 0 and 1
     """
-    ws = int(window_size * sr)
-    hs = int(hop_size * sr)
-    windows: List[np.ndarray] = []
-    for start in range(0, len(audio) - ws + 1, hs):
-        windows.append(audio[start : start + ws])
-    return windows
+    # 1) Pad to at least min_duration
+    min_len = int(min_duration * sr)
+    if len(audio) < min_len:
+        padding = min_len - len(audio)
+        audio = np.pad(audio, (0, padding), mode="constant")
 
+    # 2) Convert to torch.Tensor; build length tensor
+    wav = torch.tensor(audio, dtype=torch.float32).unsqueeze(0)  # (1, time)
+    wav_lens = torch.tensor([wav.size(-1)], dtype=torch.long)   # (1,)
 
-def detect_language(
-    window: np.ndarray,
-    sr: int
-) -> Tuple[str, float]:
-    """
-    Detect the language of a short audio window, but restrict to EN vs. ES.
+    # 3) Move to model's device
+    device = LANG_ID.device
+    wav, wav_lens = wav.to(device), wav_lens.to(device)
 
-    Args:
-        window: Audio window numpy array (float32).
-        sr:    Sample rate (must be 16 kHz for Whisper).
+    # 4) Run classification
+    _, probs, _, predicted = LANG_ID.classify_batch(wav, wav_lens)
+    # predicted[0] is the model's best-label string (e.g. 'Spanish', 'English', etc.)
+    best_label = predicted[0].lower()
+    confidence = float(probs[0].max())
 
-    Returns:
-        (language_code, confidence_score) where language_code ∈ {"en","es","un"}
-    """
-    # 1) Convert to Whisper’s expected input
-    audio_tensor = torch.from_numpy(window).to(device)
-    audio_tensor = whisper.pad_or_trim(audio_tensor)
-
-    # 2) Compute log-Mel spectrogram
-    mel = whisper.log_mel_spectrogram(audio_tensor).to(device)
-
-    # 3) Get the full whisper LID probability map
-    #    detect_language returns (detected, probs) but we only need probs
-    _, lang_probs = _model.detect_language(mel)
-
-    # 4) Pull out just English and Spanish
-    en_prob = float(lang_probs.get("en", 0.0))
-    es_prob = float(lang_probs.get("es", 0.0))
-
-    # 5) Pick the winner (or mark 'un' if both are zero)
-    if en_prob == 0 and es_prob == 0:
-        return "un", 0.0
-    if en_prob >= es_prob:
-        return "en", en_prob
+    # 5) Map any detected Spanish to 'es'; everything else → 'en'
+    if 'spanish' in best_label or best_label in ('es', 'spa'):
+        return 'es', confidence
     else:
-        return "es", es_prob
+        return 'en', confidence
 
 
-
-
-def label_windows(
-    windows: List[np.ndarray],
-    sr: int,
-    threshold: float,
-    window_size: float,
-    hop_size: float
-) -> List[Tuple[float, float, str, float]]:
+def label_languages(
+    path: str,
+    frame_ms: float = 30.0,
+    padding_s: float = 0.1
+) -> list[tuple[float, float, str, float]]:
     """
-    Label each window with a language code and confidence.
+    Detect speech turns via VAD and classify each segment as 'en' or 'es'.
 
     Args:
-        windows: List of audio windows.
-        sr: Sample rate (unused, for API symmetry).
-        threshold: Minimum confidence to accept label.
-        window_size: Window length in seconds.
-        hop_size: Hop length in seconds.
+        path: path to input audio file
+        frame_ms: VAD frame size in milliseconds
+        padding_s: padding around each segment in seconds
 
     Returns:
-        List of tuples (t_start, t_end, lang, confidence).
+        A list of (start_time, end_time, iso_code, confidence)
     """
-    spans: List[Tuple[float, float, str, float]] = []
-    for idx, w in enumerate(windows):
-        lang, conf = detect_language(w, sr)
-        # Map low-confidence or out-of-domain to 'un' (uncertain)
-        if conf < threshold or lang not in ("en", "es"):
-            lang = "un"
-        t_start = idx * hop_size
-        t_end = t_start + window_size
-        spans.append((t_start, t_end, lang, conf))
-    return spans
+    # 1) Find speech segments
+    turns = get_speech_turns(path, frame_ms=frame_ms, padding_s=padding_s)
+
+    # 2) Load full audio for slicing
+    audio, sr = load_and_normalize(path, sr=16000, mono=True)
+
+    results = []
+    for start, end in turns:
+        s_idx, e_idx = int(start * sr), int(end * sr)
+        segment = audio[s_idx:e_idx]
+        iso, conf = classify_segment(segment, sr=sr)
+        results.append((start, end, iso, conf))
+    return results
 
 
-def merge_labels(
-    spans: List[Tuple[float, float, str, float]]
-) -> List[Tuple[float, float, str]]:
-    """
-    Merge only adjacent spans with the identical language label.
-    Leave all 'un' segments (and any other brief flips) intact.
+if __name__ == "__main__":
+    import argparse
 
-    Args:
-        spans: List of (t_start, t_end, lang, conf).
+    parser = argparse.ArgumentParser(description="VAD + LID (en vs es)")
+    parser.add_argument("audio_path", help="Path to input audio file")
+    parser.add_argument(
+        "--frame_ms", type=float, default=30.0, help="VAD frame length (ms)"
+    )
+    parser.add_argument(
+        "--padding_s", type=float, default=0.1, help="Padding around speech turns (s)"
+    )
+    args = parser.parse_args()
 
-    Returns:
-        List of merged segments as (t_start, t_end, lang).
-    """
-    if not spans:
-        return []
-
-    merged: List[Tuple[float, float, str]] = []
-    cur_start, cur_end, cur_lang, _ = spans[0]
-
-    for start, end, lang, _ in spans[1:]:
-        if lang == cur_lang:
-            # same language → extend the current segment
-            cur_end = end
-        else:
-            # different language → emit the current, start a new one
-            merged.append((cur_start, cur_end, cur_lang))
-            cur_start, cur_end, cur_lang = start, end, lang
-
-    # emit the final segment
-    merged.append((cur_start, cur_end, cur_lang))
-    return merged
-
-
-
-def segment_audio(
-    audio: np.ndarray,
-    sr: int,
-    window_size: float,
-    hop_size: float,
-    threshold: float,
-    min_duration: float
-) -> List[Tuple[np.ndarray, float, float, str]]:
-    """
-    Full LID pipeline: windowing, labeling, and merging.
-
-    Args:
-        audio: Full audio array.
-        sr: Sample rate.
-        window_size: Window length (s).
-        hop_size: Hop length (s).
-        threshold: Confidence threshold for labels.
-        min_duration: Minimum duration (s) to keep segments.
-
-    Returns:
-        List of tuples (segment_audio, t_start, t_end, lang).
-    """
-    windows = slide_windows(audio, sr, window_size, hop_size)
-    spans = label_windows(windows, sr, threshold, window_size, hop_size)
-    merged = merge_labels(spans)
-
-    segments: List[Tuple[np.ndarray, float, float, str]] = []
-    for t_start, t_end, lang in merged:
-        start_idx = int(t_start * sr)
-        end_idx = int(t_end * sr)
-        segment = audio[start_idx:end_idx]
-        segments.append((segment, t_start, t_end, lang))
-    return segments
+    for start, end, iso, conf in label_languages(
+        args.audio_path, frame_ms=args.frame_ms, padding_s=args.padding_s
+    ):
+        print(f"{start:.2f}s–{end:.2f}s:\t{iso}\t{conf:.2f}")
