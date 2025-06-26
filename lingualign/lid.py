@@ -1,126 +1,194 @@
 # lingualign/lid.py
 
-"""
-Language Identification (LID) utilities using SpeechBrain ECAPA-TDNN.
-
-This module provides functions to:
-  - load a pretrained ECAPA-TDNN language ID model
-  - classify individual audio segments as English vs. Spanish
-  - process VAD segments end-to-end
-"""
+import os
+import difflib
+from typing import List, Dict, Union, Optional
 
 import numpy as np
 import torch
+import whisperx
+from wordfreq import zipf_frequency
+import marisa_trie
 from speechbrain.inference.classifiers import EncoderClassifier
+from lingualign.io import load_and_normalize
 
-from .vad import get_speech_turns
-from .io import load_and_normalize
-
-# Load ECAPA-TDNN VoxLingua107 LID model once at import
-LANG_ID = EncoderClassifier.from_hparams(
-    source="speechbrain/lang-id-voxlingua107-ecapa",
-    savedir="pretrained_models/lang-id-voxlingua107-ecapa",
-)
-
-# Suppress the “expect_len” warning if it appears
-try:
-    LANG_ID.hparams.label_encoder.ignore_len()
-except Exception:
-    pass
+def load_lexicon_trie(path: str) -> marisa_trie.Trie:
+    """
+    Read a one-word-per-line file and return a marisa_trie.Trie for fast lookup.
+    """
+    with open(path, encoding="utf-8") as f:
+        words = [line.strip().lower() for line in f if line.strip()]
+    return marisa_trie.Trie(words)
 
 
-def classify_segment(
-    audio: np.ndarray,
+def init_audio_lid(
+    source: str = "speechbrain/lang-id-voxlingua107-ecapa",
+    savedir: str = "pretrained_models/lang-id-voxlingua107-ecapa",
+    device: str = "cpu",
+) -> EncoderClassifier:
+    """
+    Load the SpeechBrain VoxLingua107 language‐ID model as an EncoderClassifier,
+    and tell its internal label_encoder exactly how many classes it has so it
+    won’t warn about unexpected lengths.
+    """
+    os.makedirs(savedir, exist_ok=True)
+    model = EncoderClassifier.from_hparams(
+        source=source,
+        savedir=savedir,
+        run_opts={"device": device},
+    )
+    # VoxLingua107 has 107 classes; make sure the encoder knows that
+    n_labels = len(model.hparams.label_encoder.ind2lab)
+    model.hparams.label_encoder.expect_len(n_labels)
+    return model
+
+
+def annotate_segments_language(
+    segments: List[Dict],
+    audio: Union[str, np.ndarray],
     sr: int = 16000,
-    min_duration: float = 0.5
-) -> (str, float):
+    en_lex_path: str = "lexicons/english.txt",
+    es_lex_path: str = "lexicons/spanish.txt",
+    model: Optional[EncoderClassifier] = None,
+    pad: float = 0.1,
+    temp: float = 5.0,
+    margin: float = 0.75,
+    fuzzy_cutoff: float = 0.8,
+    debug: bool = False,
+) -> List[Dict]:
     """
-    Classify a raw audio segment as English ('en') or Spanish ('es').
+    Annotate each word in `segments` with:
+      - 'lang': 'en', 'es', or None
+      - 'lang_confidence': float [0.0–1.0]
 
-    Pads very short segments, runs the ECAPA-TDNN model, and
-    maps the predicted language to either 'en' or 'es'.
-
-    Args:
-        audio: 1-D numpy array of float32 samples at `sr`
-        sr: sampling rate (default: 16000)
-        min_duration: minimum segment length in seconds; pad if shorter
-
-    Returns:
-        iso_code: 'en' or 'es'
-        confidence: float probability between 0 and 1
+    Steps:
+      1) Exact lexicon lookup via marisa-trie (with fuzzy‐in‐other‐list check)
+      2) Zipf‐sigmoid tie‐breaker
+      3) Audio‐based fallback via SpeechBrain
     """
-    # 1) Pad to at least min_duration
-    min_len = int(min_duration * sr)
-    if len(audio) < min_len:
-        padding = min_len - len(audio)
-        audio = np.pad(audio, (0, padding), mode="constant")
 
-    # 2) Convert to torch.Tensor; build length tensor
-    wav = torch.tensor(audio, dtype=torch.float32).unsqueeze(0)  # (1, time)
-    wav_lens = torch.tensor([wav.size(-1)], dtype=torch.long)   # (1,)
+    # 1) Load lexica
+    en_trie = load_lexicon_trie(en_lex_path)
+    es_trie = load_lexicon_trie(es_lex_path)
 
-    # 3) Move to model's device
-    device = LANG_ID.device
-    wav, wav_lens = wav.to(device), wav_lens.to(device)
+    # 2) Init SpeechBrain LID if needed
+    if model is None:
+        model = init_audio_lid(device="cpu")
 
-    # 4) Run classification
-    _, probs, _, predicted = LANG_ID.classify_batch(wav, wav_lens)
-    # predicted[0] is the model's best-label string (e.g. 'Spanish', 'English', etc.)
-    best_label = predicted[0].lower()
-    confidence = float(probs[0].max())
+    # 3) Load or accept audio array
+    if isinstance(audio, (str, os.PathLike)):
+        audio, _ = load_and_normalize(str(audio), sr=sr, mono=True)
+    # else: assume already a np.ndarray
+    total_dur = len(audio) / sr
 
-    # 5) Map any detected Spanish to 'es'; everything else → 'en'
-    if 'spanish' in best_label or best_label in ('es', 'spa'):
-        return 'es', confidence
-    else:
-        return 'en', confidence
+    # 4) Annotate each word
+    for seg in segments:
+        for w in seg.get("words", []):
+            tok = w["word"].lower().strip(".,?!)('\"")
+            in_en = tok in en_trie
+            in_es = tok in es_trie
 
+            if debug:
+                print(f"[LEX] tok={tok!r}, in_en={in_en}, in_es={in_es}")
 
-def label_languages(
-    path: str,
-    frame_ms: float = 30.0,
-    padding_s: float = 0.1
-) -> list[tuple[float, float, str, float]]:
-    """
-    Detect speech turns via VAD and classify each segment as 'en' or 'es'.
+            # 4.1) Exact lexicon—but check for a fuzzy hit in the *other* trie first
+            fuzzy = []
+            if in_en ^ in_es:
+                other = es_trie if in_en else en_trie
+                fuzzy = difflib.get_close_matches(tok, other.keys(),
+                                                  n=1, cutoff=fuzzy_cutoff)
+                if debug:
+                    print(f"[FUZZY] tok={tok!r}, fuzzy_match={fuzzy}")
+                if not fuzzy:
+                    # truly unambiguous by lexicon
+                    w["lang"] = "en" if in_en else "es"
+                    w["lang_confidence"] = 1.0
+                    if debug:
+                        print(f"[ASSIGN] {tok!r} → {w['lang']} (lexicon)\n")
+                    continue
+                # else: fall through to tie-breaker & audio but keep `fuzzy[0]` in mind
 
-    Args:
-        path: path to input audio file
-        frame_ms: VAD frame size in milliseconds
-        padding_s: padding around each segment in seconds
+            # 4.2) Zipf‐sigmoid tie‐breaker
+            freq_en = zipf_frequency(tok, "en")
+            freq_es = zipf_frequency(tok, "es")
+            diff    = freq_en - freq_es
+            p_en    = 1.0 / (1.0 + 10 ** (-diff))
+            p_es    = 1.0 - p_en
+            if debug:
+                print(f"[ZIPF] tok={tok!r}, p_en={p_en:.2f}, p_es={p_es:.2f}")
 
-    Returns:
-        A list of (start_time, end_time, iso_code, confidence)
-    """
-    # 1) Find speech segments
-    turns = get_speech_turns(path, frame_ms=frame_ms, padding_s=padding_s)
+            if p_en >= margin:
+                w["lang"], w["lang_confidence"] = "en", p_en
+                if debug:
+                    print(f"[ASSIGN] {tok!r} → en (zipf)\n")
+                continue
+            elif p_es >= margin:
+                w["lang"], w["lang_confidence"] = "es", p_es
+                if debug:
+                    print(f"[ASSIGN] {tok!r} → es (zipf)\n")
+                continue
 
-    # 2) Load full audio for slicing
-    audio, sr = load_and_normalize(path, sr=16000, mono=True)
+            # 4.3) Audio‐based fallback
+            if debug:
+                print(f"[AUDIO] fallback for {tok!r}")
+            start = max(0.0, w["start"] - pad)
+            end   = min(total_dur, w["end"] + pad)
+            clip  = audio[int(start * sr) : int(end * sr)]
+            if clip.size == 0:
+                w["lang"], w["lang_confidence"] = None, 0.0
+                if debug:
+                    print(f"[AUDIO] {tok!r} → clip empty\n")
+                continue
 
-    results = []
-    for start, end in turns:
-        s_idx, e_idx = int(start * sr), int(end * sr)
-        segment = audio[s_idx:e_idx]
-        iso, conf = classify_segment(segment, sr=sr)
-        results.append((start, end, iso, conf))
-    return results
+            # wrap into [1, T]
+            wav = torch.from_numpy(clip).unsqueeze(0)
 
+            # (a) feature extractor (STFT/FBANK…)
+            fe_mod = next((m for n,m in model.mods.items() if "compute" in n), None)
+            feats  = fe_mod(wav) if fe_mod else wav
 
-if __name__ == "__main__":
-    import argparse
+            # (b) encoder/embedding
+            enc_mod = next(
+                (m for n,m in model.mods.items()
+                    if ("embed" in n or "encoder" in n) and "compute" not in n),
+                None
+            )
+            if enc_mod is None:
+                raise RuntimeError("Can't find encoder module in model.mods")
+            embeds = enc_mod(feats)
 
-    parser = argparse.ArgumentParser(description="VAD + LID (en vs es)")
-    parser.add_argument("audio_path", help="Path to input audio file")
-    parser.add_argument(
-        "--frame_ms", type=float, default=30.0, help="VAD frame length (ms)"
-    )
-    parser.add_argument(
-        "--padding_s", type=float, default=0.1, help="Padding around speech turns (s)"
-    )
-    args = parser.parse_args()
+            # (c) classification head → logits
+            head_mod = next(
+                (m for n,m in model.mods.items() if "classif" in n or "proj" in n),
+                None
+            )
+            if head_mod is None:
+                raise RuntimeError("Can't find classification head in model.mods")
+            logits = head_mod(embeds).squeeze(0)   # → [N_class]
 
-    for start, end, iso, conf in label_languages(
-        args.audio_path, frame_ms=args.frame_ms, padding_s=args.padding_s
-    ):
-        print(f"{start:.2f}s–{end:.2f}s:\t{iso}\t{conf:.2f}")
+            # (d) temperature‐scaled softmax → probabilities
+            probs_arr = torch.softmax(logits / temp, dim=-1).cpu().numpy()
+            # sometimes it comes as [[…]] shape
+            if probs_arr.ndim == 2 and probs_arr.shape[0] == 1:
+                probs_arr = probs_arr[0]
+
+            # (e) recover label texts & codes
+            le      = model.hparams.label_encoder
+            ind2lab = le.ind2lab
+            labels  = [ind2lab[i] for i in range(len(probs_arr))]
+            codes   = [lbl.split(":", 1)[0] for lbl in labels]
+
+            # (f) pick
+            probs_map = dict(zip(codes, probs_arr))
+            p_en2     = probs_map.get("en", 0.0)
+            p_es2     = probs_map.get("es", 0.0)
+            if p_en2 >= p_es2:
+                chosen, conf = "en", p_en2
+            else:
+                chosen, conf = "es", p_es2
+
+            w["lang"], w["lang_confidence"] = chosen, float(conf)
+            if debug:
+                print(f"[AUDIO] {tok!r} → {chosen} ({conf:.2f})\n")
+
+    return segments

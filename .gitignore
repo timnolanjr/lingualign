@@ -1,21 +1,24 @@
 # Python
 __pycache__/
 *.py[cod]
-*.so
+*.pkl
 
-# Virtual environment
+# Virtualenv
 venv/
+.env
 
-# Models and raw audio
-models/
+# HuggingFace / Pyannote caches
+local_diarization/
+pretrained_models/
+~/.cache/huggingface/
+
+# Generated TeX & PDFs
+tex/
+*.aux
+*.log
+*.pdf
+*.toc
+
+# Large data
 raw_audio/
 
-# Editor/IDE files
-*.swp
-*.sublime-workspace
-
-# pyenv
-.python-version
-
-# MacOS annoyance
-.DS_STORE
