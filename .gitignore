@@ -22,3 +22,5 @@ tex/
 # Large data
 raw_audio/
 
+#Mac OSX
+.DS_STORE

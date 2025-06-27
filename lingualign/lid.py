@@ -5,6 +5,7 @@ import difflib
 from typing import List, Dict, Union, Optional
 
 import numpy as np
+from tqdm import tqdm
 import torch
 import whisperx
 from wordfreq import zipf_frequency
@@ -82,7 +83,7 @@ def annotate_segments_language(
     total_dur = len(audio) / sr
 
     # 4) Annotate each word
-    for seg in segments:
+    for seg in tqdm(segments, desc="LID segments"):
         for w in seg.get("words", []):
             tok = w["word"].lower().strip(".,?!)('\"")
             in_en = tok in en_trie
