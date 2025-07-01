@@ -30,22 +30,29 @@ def to_tex(
     """
     Render a LaTeX screenplay (.tex + .pdf) for `segments`.
     Places outputs under output_dir/<stem>/<stem>.tex and .pdf.
+    Adds a parent-folder title above the per-track title.
     """
 
     base_out = Path(output_dir) / Path(audio_path).stem
     base_out.mkdir(parents=True, exist_ok=True)
 
-    stem      = Path(audio_path).stem
-    doc_title = sanitize_latex(title or stem)
+    stem       = Path(audio_path).stem
+    doc_title  = sanitize_latex(title or stem)
+    # parent folder name, e.g. "Language Transfer, Complete Spanish"
+    parent_name = sanitize_latex(Path(audio_path).parent.name)
 
-    # 1) Build the preamble + manual title
+    # 1) Build the preamble + titles
     lines: List[str] = [
         r"\documentclass{screenplay}",
         r"\usepackage[utf8]{inputenc}",
         r"\usepackage[T1]{fontenc}",
         r"\usepackage{lmodern}",
         r"\begin{document}",
-        rf"\begin{{center}}{{\LARGE\bfseries {doc_title}}}\end{{center}}",
+        # Parent-folder title
+        rf"\begin{{center}}{{\LARGE\bfseries {parent_name}}}\end{{center}}",
+        "",
+        # Per-track title
+        rf"\begin{{center}}{{\Large\bfseries {doc_title}}}\end{{center}}",
         ""
     ]
 
@@ -60,7 +67,7 @@ def to_tex(
         for w in seg["words"]:
             tok = sanitize_latex(w["word"])
             if w.get("lang") == "es":
-                tok = r"\textbf{" + tok + "}"
+                tok = r"\textbf{\textit{" + tok + "}}"
             tokens.append(tok)
         lines.append(" ".join(tokens))
         lines.append(r"\end{dialogue}")
@@ -73,7 +80,6 @@ def to_tex(
     tex_path.write_text("\n".join(lines), encoding="utf-8")
     print(f"▶ Writing LaTeX     → {tex_path}")
 
-    # run pdflatex twice
     for _ in range(2):
         subprocess.run(
             ["pdflatex", "-interaction=batchmode", tex_path.name],

@@ -1,36 +1,58 @@
-# MultilingualTranscriptMaker
+# Lingualign
 
-When presented with a multilingual audio file, most transcript applications default to a single language and automatically translate non-target-language segments. **MultilingualTranscriptMaker** is a tool that produces a **multilingual output** that retains the original language diversity. This is especially useful for creating language learning materials.
+**Lingualign** is an end-to-end transcription toolkit designed to preserve the integrity of multilingual audio streams. While standard transcription tools default to one language, Lingualign was built to preserve the integrity of mixed-language audio content like bilingual podcasts, interviews, and songs. It was created to supplement comprehensible-input language lessons, giving learners clear, context-preserving transcripts of authentic materials. It is a tool multilingual educators and creators can use to automatically caption multilingual content.
+---
 
-**MultilingualTranscriptMaker** was built with the following goals in mind:
-- **Preserve Language Diversity:** Keep all the different languages present in an audio file.
-- **Flexible Output Options:** Enable future support for both multilingual transcripts and single-language outputs that highlight off-language segments (see [Feature Roadmap](#feature-roadmap)).
+## Pipeline Overview
+
+Lingualign processes audio in four stages:
+
+1. **Transcribe & Align**  
+   Uses [WhisperX](https://github.com/m-bain/whisperX/tree/main) to generate a transcript with precise word-level timecodes.
+
+2. **Diarize**  
+   WhisperX applies PyAnnote under the hood to label “who spoke when,” so you can distinguish speakers.
+
+3. **Language ID**  
+   Runs [SpeechBrain](https://github.com/speechbrain/speechbrain) to tag each word by language (e.g., English, Spanish).
+
+4. **Export**  
+   Produces multiple formats for your needs:  
+   - **Plain text** (`.txt`) for quick reading  
+   - **Markdown** (`.md`) for easy annotation  
+   - **SRT** (`.srt`) for subtitles  
+   - **Screenplay-style PDF** (`.tex` + `.pdf`) for polished handouts  
+
+---
 
 ## Current Features
 
-- **Bilingual English \& Spanish Transcription:** As a first pass, proof-of-concept, I've started with transcription of audio files that contain English and Spanish (my particular use case).
+- Hard-coded to work for English and Spanish audio only for now...
+- No GPU access currently, so I'd love to hear about its performance!
 
-## Feature Roadmap
+---
 
-- **Multilingual Transcription:** Accurately transcribe audio files containing multiple languages without default auto-translation.
-- **Flexible Output Formats:** Maintain the original language context in the transcript.
+## Roadmap
 
-## Requirements
+1. **Broader language support**  
+   - Integrate additional lexicons (French, German, Mandarin, Arabic, etc.)  
+   - Automatic model selection based on file metadata or user flag
 
-- Python 3.8+
-- [OpenAI Whisper](https://github.com/openai/whisper) for audio transcription
+3. **Enhanced exports**  
+   - Full transcript translated entirely into 2+ languages
+   - Interactive HTML transcripts with clickable speaker/language filters  
+   - Subtitle packages for YouTube, TikTok, and broadcast standards (host this as a web service?)
 
-## Installation
 
-**Clone the repository:**
+## Thanks
 
-   ```bash
-   git clone https://github.com/timnolanjr/MultilingualTranscriptMaker.git
-   cd MultilingualTranscriptMaker 
-```
+This project stands on the shoulders of giants. Big thanks to:
+- OpenAI for Whisper (and for actually being open...)
+- m-bain for WhisperX, which makes this project possible
 
-## Shoutouts
+---
 
-A special thanks to OpenAI for *actually* being true to their name for once with Whisper, and [cainky/SoundcloudDownloader](https://github.com/cainky/SoundcloudDownloader) for a helpful tool!
+## License
 
+MIT License — see [LICENSE](LICENSE) for details.  
 
