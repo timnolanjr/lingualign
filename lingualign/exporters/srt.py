@@ -1,47 +1,44 @@
-"""
-Produce an .srt subtitle file.  Spanish tokens get <b>…</b>.
-"""
-
+from pathlib import Path
 from typing import List, Dict
-import datetime
 
+def _sec_to_srt(ts: float) -> str:
+    h = int(ts // 3600)
+    m = int((ts % 3600) // 60)
+    s = int(ts % 60)
+    ms = int((ts - int(ts)) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-def _sec_to_srt_timestamp(t: float) -> str:
-    # Convert seconds float to "HH:MM:SS,mmm"
-    td = datetime.timedelta(seconds=t)
-    total_ms = int(td.total_seconds() * 1000)
-    hours, rem = divmod(total_ms, 3600_000)
-    minutes, rem = divmod(rem, 60_000)
-    seconds, ms = divmod(rem, 1000)
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{ms:03d}"
-
-
-def to_srt(segments: List[Dict], out_path: str) -> None:
+def to_srt(
+    segments: List[Dict],
+    audio_path: str,
+    output_dir: Path,
+) -> Path:
     """
-    segments: output of assign_word_speakers+annotate_segments_language
+    Write a standard SubRip .srt file.
+    Spanish words get <i><b>…</b></i> tags.
     """
-    entries = []
+    stem = Path(audio_path).stem
+    out = output_dir / f"{stem}.srt"
+
     idx = 1
+    lines = []
     for seg in segments:
-        start = seg["start"]
-        end = seg["end"]
-        # wrap words
-        words = []
+        start, end = seg["start"], seg["end"]
+        spk = seg.get("speaker", "UNK")
+        tokens = []
         for w in seg["words"]:
             tok = w["word"]
             if w.get("lang") == "es":
-                tok = f"<b>{tok}</b>"
-            words.append(tok)
-        text = " ".join(words)
-        entries.append(
-            "\n".join([
-                str(idx),
-                f"{_sec_to_srt_timestamp(start)} --> {_sec_to_srt_timestamp(end)}",
-                text,
-                ""
-            ])
-        )
+                tok = f"<i><b>{tok}</b></i>"
+            tokens.append(tok)
+        text = " ".join(tokens)
+
+        lines.append(str(idx))
+        lines.append(f"{_sec_to_srt(start)} --> {_sec_to_srt(end)}")
+        lines.append(f"{spk}: {text}")
+        lines.append("")
         idx += 1
 
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(entries))
+    out.write_text("\n".join(lines), encoding="utf-8")
+    print(f"▶ Writing SRT → {out}")
+    return out

@@ -1,23 +1,30 @@
-"""
-Produce a Markdown‐flavored transcript, bolding Spanish tokens.
-"""
-
+from pathlib import Path
 from typing import List, Dict
 
 def to_markdown(
     segments: List[Dict],
-    out_path: str,
-    bold_tag: str = "**"
-) -> None:
-    lines = []
+    audio_path: str,
+    output_dir: Path,
+) -> Path:
+    """
+    Write a .md transcript, one segment per paragraph.
+    Spanish words get ***bold+italic*** emphasis.
+    """
+    stem = Path(audio_path).stem
+    out = output_dir / f"{stem}.md"
+
+    lines = [f"# Transcript: {stem}", ""]
     for seg in segments:
-        speaker = seg.get("speaker", "UNK")
+        spk = seg.get("speaker", "UNK")
         tokens = []
         for w in seg["words"]:
             tok = w["word"]
             if w.get("lang") == "es":
-                tok = f"{bold_tag}{tok}{bold_tag}"
+                tok = f"***{tok}***"
             tokens.append(tok)
-        lines.append(f"**{speaker}**: {' '.join(tokens)}")
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\n\n".join(lines))
+        text = " ".join(tokens)
+        lines.append(f"**{spk}**: {text}")
+        lines.append("")
+    out.write_text("\n".join(lines), encoding="utf-8")
+    print(f"▶ Writing Markdown → {out}")
+    return out

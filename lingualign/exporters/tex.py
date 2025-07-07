@@ -24,71 +24,69 @@ def to_tex(
     segments: List[Dict],
     audio_path: str,
     output_dir: str,
+    compile_pdf: bool = True,
     title: Optional[str] = None,
-    role_map: Optional[Dict[str, str]] = None,
 ) -> Path:
     """
-    Render a LaTeX screenplay (.tex + .pdf) for `segments`.
-    Places outputs under output_dir/<stem>/<stem>.tex and .pdf.
-    Adds a parent-folder title above the per-track title.
+    Render a LaTeX screenplay (.tex + optionally .pdf).
+    Spanish words become \\textbf{\\textit{…}}.
     """
 
-    base_out = Path(output_dir) / Path(audio_path).stem
-    base_out.mkdir(parents=True, exist_ok=True)
-
+    output_dir = Path(output_dir)
     stem       = Path(audio_path).stem
-    doc_title  = sanitize_latex(title or stem)
-    # parent folder name, e.g. "Language Transfer, Complete Spanish"
-    parent_name = sanitize_latex(Path(audio_path).parent.name)
 
-    # 1) Build the preamble + titles
+    # If they already passed .../results/Track_02_90s as output_dir,
+    # don't do results/Track_02_90s/Track_02_90s again.
+    if output_dir.name == stem:
+        track_dir = output_dir
+    else:
+        track_dir = output_dir / stem
+
+    track_dir.mkdir(parents=True, exist_ok=True)
+
+    doc_title    = sanitize_latex(title or stem)
+    parent_title = sanitize_latex(Path(audio_path).parent.name)
+
     lines: List[str] = [
         r"\documentclass{screenplay}",
         r"\usepackage[utf8]{inputenc}",
         r"\usepackage[T1]{fontenc}",
         r"\usepackage{lmodern}",
         r"\begin{document}",
-        # Parent-folder title
-        rf"\begin{{center}}{{\LARGE\bfseries {parent_name}}}\end{{center}}",
+        rf"\begin{{center}}{{\LARGE\bfseries {parent_title}}}\end{{center}}",
         "",
-        # Per-track title
         rf"\begin{{center}}{{\Large\bfseries {doc_title}}}\end{{center}}",
         ""
     ]
 
-    # 2) Dialogue blocks
     for seg in segments:
-        raw_role = seg.get("speaker", "UNK")
-        mapped   = role_map.get(raw_role, raw_role) if role_map else raw_role
-        role     = sanitize_latex(mapped)
-
+        role = sanitize_latex(seg.get("speaker", "UNK"))
         lines.append(rf"\begin{{dialogue}}{{{role}}}")
-        tokens: List[str] = []
+        toks: List[str] = []
         for w in seg["words"]:
             tok = sanitize_latex(w["word"])
             if w.get("lang") == "es":
                 tok = r"\textbf{\textit{" + tok + "}}"
-            tokens.append(tok)
-        lines.append(" ".join(tokens))
+            toks.append(tok)
+        lines.append(" ".join(toks))
         lines.append(r"\end{dialogue}")
         lines.append("")
 
     lines.append(r"\end{document}")
 
-    # 3) Write .tex and compile
-    tex_path = base_out / f"{stem}.tex"
+    tex_path = track_dir / f"{stem}.tex"
     tex_path.write_text("\n".join(lines), encoding="utf-8")
-    print(f"▶ Writing LaTeX     → {tex_path}")
+    print(f"▶ Writing LaTeX  → {tex_path}")
 
-    for _ in range(2):
-        subprocess.run(
-            ["pdflatex", "-interaction=batchmode", tex_path.name],
-            cwd=str(base_out),
-            check=True,
-        )
+    if compile_pdf:
+        for _ in range(2):
+            subprocess.run(
+                ["pdflatex", "-interaction=batchmode", tex_path.name],
+                cwd=str(track_dir),
+                check=True,
+            )
+        pdf_path = track_dir / f"{stem}.pdf"
+        print(f"✔ PDF generated → {pdf_path}")
+        return pdf_path
 
-    pdf_path = base_out / f"{stem}.pdf"
-    print(f"✔ PDF generated → {pdf_path}")
-    return pdf_path
-
-__all__ = ["to_tex"]
+    return tex_path
