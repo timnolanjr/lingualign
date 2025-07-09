@@ -1,96 +1,195 @@
-# lingualign/io.py
-
-"""
-I/O utilities for Lingualign: decoding any audio/video file
-into a normalized NumPy array ready for downstream processing.
-
-This module depends on:
-  - ffmpeg (installed and on your PATH)
-  - soundfile (PySoundFile)
-  - numpy
-"""
-
-import subprocess
-import io
+#!/usr/bin/env python3
+import argparse
+import json
+import time
+import datetime
 from pathlib import Path
-from typing import Tuple
 
-import numpy as np
-import soundfile as sf
+import whisperx
+from lingualign.io import load_and_normalize
+from lingualign.lid import init_audio_lid, annotate_segments_language
+
+from lingualign.exporters.plain import to_plain
+from lingualign.exporters.markdown import to_markdown
+from lingualign.exporters.srt import to_srt
+from lingualign.exporters.tex import to_tex
 
 
-def load_and_normalize(
-    path: str,
-    sr: int = 16_000,
-    mono: bool = True
-) -> Tuple[np.ndarray, int]:
-    """
-    Decode an audio or video file into a NumPy array of float32 samples.
+def map_speakers_to_roles(segments, roles_json_path):
+    with open(roles_json_path, encoding="utf-8") as f:
+        role_map = json.load(f)
+    for seg in segments:
+        raw = seg.get("speaker", "")
+        human = role_map.get(raw, raw)
+        seg["speaker"] = human
+        for w in seg["words"]:
+            w["speaker"] = human
 
-    This function invokes ffmpeg under the hood to handle virtually any
-    input format (MP3, M4A, MP4, WAV, etc.), resamples to `sr`, and
-    outputs either mono or stereo according to `mono`.
 
-    Args:
-        path (str):
-            Path to the input file. Can be any format ffmpeg supports.
-        sr (int, optional):
-            Desired sampling rate in Hz for the output array.
-            Defaults to 16000.
-        mono (bool, optional):
-            If True, downmix to a single channel. If False, preserves
-            two channels. Defaults to True.
+def run_one(
+    audio_path: str,
+    output_root: str,
+    formats: list[str],
+    batch_size: int,
+    device_asr: str,
+    device_lid: str,
+    compile_pdf: bool,
+    margin: float,
+):
+    t0 = time.perf_counter()
+    stem   = Path(audio_path).stem
+    outdir = Path(output_root) / stem
+    outdir.mkdir(parents=True, exist_ok=True)
 
-    Returns:
-        Tuple[np.ndarray, int]:
-            - data: 1-D (mono) or 2-D (stereo) NumPy array of dtype float32,
-              with values in [-1.0, 1.0].
-            - sr: The sampling rate of the returned data (will equal the
-              requested `sr` on success).
+    # 1) load & normalize audio
+    audio, sr = load_and_normalize(audio_path, sr=16000, mono=True)
 
-    Raises:
-        FileNotFoundError:
-            If `path` does not exist.
-        RuntimeError:
-            If ffmpeg fails (non-zero exit code), or if the decoded
-            sample rate does not match the requested `sr`.
+    # 2) ASR w/ CUDA/FP16 → CPU/FP32 fallback
+    compute_type = "float16"
+    print(f"▶ Loading WhisperX ASR model 'medium' on {device_asr}/{compute_type}…")
+    try:
+        asr = whisperx.load_model("medium", device=device_asr, compute_type=compute_type)
+    except ValueError as e:
+        print(f"⚠️  {e} — falling back to CPU/float32")
+        device_asr   = "cpu"
+        compute_type = "float32"
+        asr = whisperx.load_model("medium", device=device_asr, compute_type=compute_type)
 
-    Example:
-        >>> audio, fs = load_and_normalize("podcast.mp3", sr=16000)
-        >>> audio.shape
-        (for mono)    # e.g. (320000,)
-        (for stereo)  # e.g. (2, 320000)
+    print(f"▶ Transcribing {stem}…")
+    result = asr.transcribe(audio, batch_size=batch_size)
+    print(f"   → {len(result['segments'])} ASR segments")
 
-        >>> fs
-        16000
-    """
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"No such file: {path}")
+    # 3) Align
+    print("▶ Aligning word‐level timestamps…")
+    align_model, metadata = whisperx.load_align_model(
+        language_code=result["language"], device=device_asr
+    )
+    aligned = whisperx.align(
+        result["segments"],
+        align_model,
+        metadata,
+        audio,
+        device_asr,
+        return_char_alignments=False,
+    )["segments"]
+    print(f"   → {len(aligned)} aligned segments")
 
-    # Construct ffmpeg command to decode and resample
-    cmd = [
-        "ffmpeg",
-        "-y",                 # overwrite output if needed
-        "-i", str(path),      # input file
-        "-vn",                # drop any video streams
-        "-ac", "1" if mono else "2",  # 1=mono, 2=stereo
-        "-ar", str(sr),       # output sampling rate
-        "-f", "wav",          # output format
-        "pipe:1",             # write to stdout
-    ]
+    # 4) Diarize
+    print("▶ Speaker diarization…")
+    diarizer = whisperx.diarize.DiarizationPipeline(device=device_asr)
+    turns    = diarizer(audio)
+    dia      = whisperx.assign_word_speakers(turns, {"segments": aligned})
+    segments = dia["segments"]
 
-    # Run ffmpeg and capture stdout/stderr
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if proc.returncode != 0:
-        err = proc.stderr.decode("utf-8", errors="ignore")
-        raise RuntimeError(f"ffmpeg failed:\n{err}")
+    # ensure every word carries the segment’s speaker
+    for seg in segments:
+        seg_spk = seg.get("speaker", "")
+        for w in seg["words"]:
+            if not w.get("speaker"):
+                w["speaker"] = seg_spk
 
-    # Read the WAV bytes from ffmpeg via an in-memory buffer
-    data, file_sr = sf.read(io.BytesIO(proc.stdout), dtype="float32")
+    # map SPEAKER_00 → Student, etc.
+    roles_json = Path(__file__).parent.parent / "roles.json"
+    map_speakers_to_roles(segments, roles_json)
+    print("   → mapped speakers → human roles")
 
-    # Sanity check: ensure we got the expected sample rate
-    if file_sr != sr:
-        raise RuntimeError(f"Unexpected sample rate: {file_sr} != {sr}")
+    # 5) per-word Language ID
+    print("▶ Initializing SpeechBrain LID model on", device_lid)
+    sb = init_audio_lid(device=device_lid)
+    print("▶ Running per-word LID…")
+    annotated = annotate_segments_language(
+        segments,
+        audio,
+        sr=sr,
+        en_lex_path="lexicons/english.txt",
+        es_lex_path="lexicons/spanish.txt",
+        model=sb,
+        margin=margin,
+    )
+    print("   → LID complete")
 
-    return data, sr
+    # 6) Export
+    if "txt" in formats or "plain" in formats:
+        to_plain(annotated, audio_path, outdir)
+    if "md" in formats or "markdown" in formats:
+        to_markdown(annotated, audio_path, outdir)
+    if "srt" in formats:
+        to_srt(annotated, audio_path, outdir)
+    if "tex" in formats:
+        to_tex(annotated, audio_path, outdir, compile_pdf=compile_pdf)
+
+    # 7) report time
+    elapsed = time.perf_counter() - t0
+    elapsed_str = str(datetime.timedelta(seconds=elapsed)).split('.')[0]
+    print(f"▶ Finished `{Path(audio_path).name}` in {elapsed_str}\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Lingualign CLI — ASR → Align → Diarize → LID → export"
+    )
+    parser.add_argument(
+        "-f", "--formats",
+        nargs="+",
+        choices=["markdown", "md", "plain", "srt", "tex", "txt"],
+        required=True,
+        help="Which output formats to produce"
+    )
+    parser.add_argument(
+        "-o", "--output",
+        required=True,
+        help="Root folder under which each track gets its own subfolder"
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=16,
+        help="ASR batch size"
+    )
+    parser.add_argument(
+        "--device-asr", dest="device_asr", default="cpu",
+        help="Device for WhisperX (e.g. cuda or cpu)"
+    )
+    parser.add_argument(
+        "--device-lid", dest="device_lid", default="cpu",
+        help="Device for SpeechBrain LID"
+    )
+    parser.add_argument(
+        "--no-pdf", action="store_false", dest="compile_pdf",
+        help="Skip running pdflatex in tex"
+    )
+    parser.add_argument(
+        "--margin", type=float, default=0.75,
+        help="Text‐based LID cutoff; below this, fall back to audio"
+    )
+    parser.add_argument(
+        "audio_paths", nargs="+",
+        help="One or more audio files or directories to process"
+    )
+
+    args = parser.parse_args()
+
+    # Expand directories into their audio files:
+    all_inputs = []
+    for p in args.audio_paths:
+        p = Path(p)
+        if p.is_dir():
+            for ext in ("mp3","m4a","wav"):
+                all_inputs.extend(sorted(p.glob(f"*.{ext}")))
+        else:
+            all_inputs.append(p)
+
+    # And now process each path in order:
+    for audio_file in all_inputs:
+        run_one(
+            str(audio_file),
+            args.output,
+            args.formats,
+            args.batch_size,
+            args.device_asr,
+            args.device_lid,
+            args.compile_pdf,
+            args.margin,
+        )
+
+
+if __name__ == "__main__":
+    main()
