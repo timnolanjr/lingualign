@@ -1,195 +1,116 @@
 # lingualign/lid.py
-
-import os
+from __future__ import annotations
+from typing import List, Dict, Optional
+from dataclasses import dataclass
 import difflib
-from typing import List, Dict, Union, Optional
-
 import numpy as np
-from tqdm import tqdm
-import torch
-import whisperx
-from wordfreq import zipf_frequency
-import marisa_trie
-from speechbrain.inference.classifiers import EncoderClassifier
-from lingualign.io import load_and_normalize
 
-def load_lexicon_trie(path: str) -> marisa_trie.Trie:
-    """
-    Read a one-word-per-line file and return a marisa_trie.Trie for fast lookup.
-    """
-    with open(path, encoding="utf-8") as f:
-        words = [line.strip().lower() for line in f if line.strip()]
-    return marisa_trie.Trie(words)
+try:
+    from speechbrain.inference.classifiers import EncoderClassifier
+    HAS_SPEECHBRAIN = True
+except Exception:
+    HAS_SPEECHBRAIN = False
 
+try:
+    from wordfreq import zipf_frequency
+    HAS_WORDFREQ = True
+except Exception:
+    HAS_WORDFREQ = False
 
-def init_audio_lid(
-    source: str = "speechbrain/lang-id-voxlingua107-ecapa",
-    savedir: str = "pretrained_models/lang-id-voxlingua107-ecapa",
-    device: str = "cpu",
-) -> EncoderClassifier:
-    """
-    Load the SpeechBrain VoxLingua107 language‐ID model as an EncoderClassifier,
-    and tell its internal label_encoder exactly how many classes it has so it
-    won’t warn about unexpected lengths.
-    """
-    os.makedirs(savedir, exist_ok=True)
-    model = EncoderClassifier.from_hparams(
-        source=source,
-        savedir=savedir,
-        run_opts={"device": device},
-    )
-    # VoxLingua107 has 107 classes; make sure the encoder knows that
-    n_labels = len(model.hparams.label_encoder.ind2lab)
-    model.hparams.label_encoder.expect_len(n_labels)
-    return model
+from .lexicon import load_lexica
+from .lang_registry import normalize_lang
 
+@dataclass
+class LIDConfig:
+    languages: Optional[List[str]] = None
+    lexicon_dir: str = 'lexicons'
+    margin: float = 0.75
+    fuzzy_cutoff: float = 0.85
+    pad: float = 0.10
+    sr: int = 16000
+    debug: bool = False
 
-def annotate_segments_language(
-    segments: List[Dict],
-    audio: Union[str, np.ndarray],
-    sr: int = 16000,
-    en_lex_path: str = "lexicons/english.txt",
-    es_lex_path: str = "lexicons/spanish.txt",
-    model: Optional[EncoderClassifier] = None,
-    pad: float = 0.1,
-    temp: float = 5.0,
-    margin: float = 0.75,
-    fuzzy_cutoff: float = 0.8,
-    debug: bool = False,
-) -> List[Dict]:
-    """
-    Annotate each word in `segments` with:
-      - 'lang': 'en', 'es', or None
-      - 'lang_confidence': float [0.0–1.0]
+def _zipf_probs(token: str, langs: List[str]) -> Dict[str, float]:
+    if not HAS_WORDFREQ or not langs:
+        return {}
+    base = {lg: (10.0 ** zipf_frequency(token, lg)) for lg in langs}
+    tot = sum(base.values()) or 1.0
+    return {lg: v / tot for lg, v in base.items()}
 
-    Steps:
-      1) Exact lexicon lookup via marisa-trie (with fuzzy‐in‐other‐list check)
-      2) Zipf‐sigmoid tie‐breaker
-      3) Audio‐based fallback via SpeechBrain
-    """
+def _extract_audio_chunk(audio: np.ndarray, sr: int, start_s: float, end_s: float, pad: float) -> np.ndarray:
+    ns = audio.shape[-1]
+    a = max(0, int(sr * (start_s - pad)))
+    b = min(ns, int(sr * (end_s + pad)))
+    return audio[..., a:b]
 
-    # 1) Load lexica
-    en_trie = load_lexicon_trie(en_lex_path)
-    es_trie = load_lexicon_trie(es_lex_path)
+def annotate_segments_language(segments: List[Dict], audio: np.ndarray | str | None, model: Optional['EncoderClassifier'], config: LIDConfig) -> List[Dict]:
+    langs = sorted({normalize_lang(x) for x in (config.languages or [])})
+    tries = load_lexica(langs, config.lexicon_dir)
 
-    # 2) Init SpeechBrain LID if needed
-    if model is None:
-        model = init_audio_lid(device="cpu")
+    for seg in segments:
+        words = seg.get('words') or []
+        for w in words:
+            tok = (w.get('word') or '').strip().lower()
+            if not tok:
+                continue
 
-    # 3) Load or accept audio array
-    if isinstance(audio, (str, os.PathLike)):
-        audio, _ = load_and_normalize(str(audio), sr=sr, mono=True)
-    # else: assume already a np.ndarray
-    total_dur = len(audio) / sr
+            exact_hits = [lg for lg, lex in tries.items() if lex.contains(tok)]
+            if len(exact_hits) == 1:
+                w['lang'], w['lang_confidence'] = exact_hits[0], 1.0
+                if config.debug: print(f"[LEX] {tok!r} -> {w['lang']}")
+                continue
 
-    # 4) Annotate each word
-    for seg in tqdm(segments, desc="LID segments"):
-        for w in seg.get("words", []):
-            tok = w["word"].lower().strip(".,?!)('\"")
-            in_en = tok in en_trie
-            in_es = tok in es_trie
+            other_vocab = []
+            for lg, lex in tries.items():
+                other_vocab.extend(lex.words)
+            if other_vocab:
+                fuzzy = difflib.get_close_matches(tok, other_vocab, n=1, cutoff=config.fuzzy_cutoff)
+                if fuzzy:
+                    for lg, lex in tries.items():
+                        if fuzzy[0] in lex.words:
+                            w['lang'], w['lang_confidence'] = lg, 0.9
+                            if config.debug: print(f"[FUZZY] {tok!r} -> {lg} (fuzzy:{fuzzy[0]!r})")
+                            break
+                    if 'lang' in w:
+                        continue
 
-            if debug:
-                print(f"[LEX] tok={tok!r}, in_en={in_en}, in_es={in_es}")
-
-            # 4.1) Exact lexicon—but check for a fuzzy hit in the *other* trie first
-            fuzzy = []
-            if in_en ^ in_es:
-                other = es_trie if in_en else en_trie
-                fuzzy = difflib.get_close_matches(tok, other.keys(),
-                                                  n=1, cutoff=fuzzy_cutoff)
-                if debug:
-                    print(f"[FUZZY] tok={tok!r}, fuzzy_match={fuzzy}")
-                if not fuzzy:
-                    # truly unambiguous by lexicon
-                    w["lang"] = "en" if in_en else "es"
-                    w["lang_confidence"] = 1.0
-                    if debug:
-                        print(f"[ASSIGN] {tok!r} → {w['lang']} (lexicon)\n")
+            zp = _zipf_probs(tok, langs)
+            if zp:
+                lg_best, p_best = max(zp.items(), key=lambda x: x[1])
+                if p_best >= config.margin:
+                    w['lang'], w['lang_confidence'] = lg_best, float(p_best)
+                    if config.debug: print(f"[ZIPF] {tok!r} -> {lg_best} ({p_best:.2f})")
                     continue
-                # else: fall through to tie-breaker & audio but keep `fuzzy[0]` in mind
 
-            # 4.2) Zipf‐sigmoid tie‐breaker
-            freq_en = zipf_frequency(tok, "en")
-            freq_es = zipf_frequency(tok, "es")
-            diff    = freq_en - freq_es
-            p_en    = 1.0 / (1.0 + 10 ** (-diff))
-            p_es    = 1.0 - p_en
-            if debug:
-                print(f"[ZIPF] tok={tok!r}, p_en={p_en:.2f}, p_es={p_es:.2f}")
+            if HAS_SPEECHBRAIN and model is not None and isinstance(audio, np.ndarray):
+                wstart = float(w.get('start', seg.get('start', 0.0)))
+                wend   = float(w.get('end', seg.get('end', wstart + 0.2)))
+                chunk = _extract_audio_chunk(audio, config.sr, wstart, wend, config.pad)
+                if chunk.size > 0:
+                    try:
+                        out = model.classify_batch(chunk[np.newaxis, :])
+                        probs = getattr(out, 'probabilities', None) or getattr(out, 'p', None)
+                        if probs is not None:
+                            texts = out[2] if isinstance(out, tuple) and len(out) >= 3 else []
+                            if not texts and hasattr(out, 'text_lab'):
+                                texts = out.text_lab
+                            temp_map: Dict[str, float] = {}
+                            for i, lab in enumerate(texts):
+                                code = lab.split(':', 1)[0].strip().lower()
+                                temp_map[code] = float(probs[0][i])
+                            cand = {k: v for k, v in temp_map.items() if not langs or k in langs}
+                            if not cand:
+                                cand = temp_map
+                            best = max(cand.items(), key=lambda x: x[1])
+                            w['lang'], w['lang_confidence'] = best[0], float(best[1])
+                            if config.debug: print(f"[SB] {tok!r} -> {w['lang']} ({w['lang_confidence']:.2f})")
+                            continue
+                    except Exception as e:
+                        if config.debug: print(f"[SB-ERR] {e}")
 
-            if p_en >= margin:
-                w["lang"], w["lang_confidence"] = "en", p_en
-                if debug:
-                    print(f"[ASSIGN] {tok!r} → en (zipf)\n")
-                continue
-            elif p_es >= margin:
-                w["lang"], w["lang_confidence"] = "es", p_es
-                if debug:
-                    print(f"[ASSIGN] {tok!r} → es (zipf)\n")
-                continue
-
-            # 4.3) Audio‐based fallback
-            if debug:
-                print(f"[AUDIO] fallback for {tok!r}")
-            start = max(0.0, w["start"] - pad)
-            end   = min(total_dur, w["end"] + pad)
-            clip  = audio[int(start * sr) : int(end * sr)]
-            if clip.size == 0:
-                w["lang"], w["lang_confidence"] = None, 0.0
-                if debug:
-                    print(f"[AUDIO] {tok!r} → clip empty\n")
-                continue
-
-            # wrap into [1, T]
-            wav = torch.from_numpy(clip).unsqueeze(0)
-
-            # (a) feature extractor (STFT/FBANK…)
-            fe_mod = next((m for n,m in model.mods.items() if "compute" in n), None)
-            feats  = fe_mod(wav) if fe_mod else wav
-
-            # (b) encoder/embedding
-            enc_mod = next(
-                (m for n,m in model.mods.items()
-                    if ("embed" in n or "encoder" in n) and "compute" not in n),
-                None
-            )
-            if enc_mod is None:
-                raise RuntimeError("Can't find encoder module in model.mods")
-            embeds = enc_mod(feats)
-
-            # (c) classification head → logits
-            head_mod = next(
-                (m for n,m in model.mods.items() if "classif" in n or "proj" in n),
-                None
-            )
-            if head_mod is None:
-                raise RuntimeError("Can't find classification head in model.mods")
-            logits = head_mod(embeds).squeeze(0)   # → [N_class]
-
-            # (d) temperature‐scaled softmax → probabilities
-            probs_arr = torch.softmax(logits / temp, dim=-1).cpu().numpy()
-            # sometimes it comes as [[…]] shape
-            if probs_arr.ndim == 2 and probs_arr.shape[0] == 1:
-                probs_arr = probs_arr[0]
-
-            # (e) recover label texts & codes
-            le      = model.hparams.label_encoder
-            ind2lab = le.ind2lab
-            labels  = [ind2lab[i] for i in range(len(probs_arr))]
-            codes   = [lbl.split(":", 1)[0] for lbl in labels]
-
-            # (f) pick
-            probs_map = dict(zip(codes, probs_arr))
-            p_en2     = probs_map.get("en", 0.0)
-            p_es2     = probs_map.get("es", 0.0)
-            if p_en2 >= p_es2:
-                chosen, conf = "en", p_en2
+            if langs:
+                w['lang'], w['lang_confidence'] = langs[0], 0.1
             else:
-                chosen, conf = "es", p_es2
-
-            w["lang"], w["lang_confidence"] = chosen, float(conf)
-            if debug:
-                print(f"[AUDIO] {tok!r} → {chosen} ({conf:.2f})\n")
+                w['lang'], w['lang_confidence'] = 'und', 0.0
 
     return segments

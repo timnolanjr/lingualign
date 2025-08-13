@@ -1,200 +1,153 @@
-#!/usr/bin/env python3
+# lingualign/pipeline.py
+from __future__ import annotations
 import argparse
-import json
-import time
-import datetime
 from pathlib import Path
+from typing import List, Dict, Optional
+import numpy as np
 
-import whisperx
-from lingualign.io import load_and_normalize
-from lingualign.lid import init_audio_lid, annotate_segments_language
+from .exporters import to_plain, to_markdown, to_srt, to_tex
 
-from lingualign.exporters.plain import to_plain
-from lingualign.exporters.markdown import to_markdown
-from lingualign.exporters.srt import to_srt
-from lingualign.exporters.tex import to_tex
+try:
+    import soundfile as sf
+except Exception:
+    sf = None
 
+try:
+    import whisperx
+    HAS_WHISPERX = True
+except Exception:
+    HAS_WHISPERX = False
 
-def map_speakers_to_roles(segments, roles_json_path):
-    with open(roles_json_path, encoding="utf-8") as f:
-        role_map = json.load(f)
-    for seg in segments:
-        raw = seg["speaker"]
-        human = role_map.get(raw, raw)
-        seg["speaker"] = human
-        for w in seg["words"]:
-            w["speaker"] = human
+try:
+    from speechbrain.inference.classifiers import EncoderClassifier
+    HAS_SPEECHBRAIN = True
+except Exception:
+    HAS_SPEECHBRAIN = False
 
+from .lang_registry import normalize_lang, capabilities, effective_language_set
+from .lid import annotate_segments_language, LIDConfig
+from .exporters import to_plain, to_markdown, to_srt
 
-def run_one(
-    audio_path: str,
-    output_root: str,
-    formats: list[str],
-    batch_size: int,
-    device_asr: str,
-    device_lid: str,
-    compile_pdf: bool,
-    margin: float,
-):
-    t0 = time.perf_counter()
-    stem   = Path(audio_path).stem
-    outdir = Path(output_root) / stem
-    outdir.mkdir(parents=True, exist_ok=True)
+def _load_audio(path: str, sr: int) -> np.ndarray:
+    if sf is None:
+        raise RuntimeError('soundfile not installed. `pip install soundfile`')
+    x, file_sr = sf.read(path, dtype='float32', always_2d=False)
+    if file_sr != sr:
+        ratio = sr / float(file_sr)
+        new_len = int(len(x) * ratio)
+        idx = np.linspace(0, len(x) - 1, new_len).astype(np.int64)
+        x = x[idx]
+    if x.ndim > 1:
+        x = x.mean(axis=-1)
+    return x
 
-    # 1) load & normalize audio (ffmpeg handles video too)
-    audio, sr = load_and_normalize(audio_path, sr=16000, mono=True)
-
-    # 2) ASR w/ CUDA/FP16 → CPU/FP32 fallback
-    compute_type = "float16"
-    print(f"▶ Loading WhisperX ASR model 'medium' on {device_asr}/{compute_type}…")
+def _transcribe_whisperx(audio_path: str, device_asr: str, device_align: str, batch_size: int, forced_language: Optional[str]) -> Dict:
+    if not HAS_WHISPERX:
+        raise RuntimeError('whisperx not installed. `pip install whisperx`')
+    model = whisperx.load_model('medium', device_asr, compute_type='float16' if 'cuda' in device_asr else 'float32')
+    audio = whisperx.load_audio(audio_path)
+    tx_kwargs = {'batch_size': batch_size}
+    if forced_language:
+        tx_kwargs['language'] = forced_language
+    result = model.transcribe(audio, **tx_kwargs)
+    lang = result.get('language')
     try:
-        asr = whisperx.load_model("medium", device=device_asr, compute_type=compute_type)
-    except ValueError as e:
-        print(f"⚠️  {e} — falling back to CPU/float32")
-        device_asr   = "cpu"
-        compute_type = "float32"
-        asr = whisperx.load_model("medium", device=device_asr, compute_type=compute_type)
+        align_model, metadata = whisperx.load_align_model(language=lang, device=device_align)
+        result['segments'] = whisperx.align(result['segments'], align_model, metadata, audio, device_align)['segments']
+    except Exception:
+        pass
+    return result
 
-    print(f"▶ Transcribing {stem}…")
-    result = asr.transcribe(audio, batch_size=batch_size)
-    print(f"   → {len(result['segments'])} ASR segments")
+def decode_with_language_candidates(audio_path: str, candidates: List[str], device_asr: str, device_align: str, batch_size: int, asr_topk: int) -> Dict:
+    if not HAS_WHISPERX or not candidates:
+        return _transcribe_whisperx(audio_path, device_asr, device_align, batch_size, None)
+    scored = []
+    for lg in candidates[:max(1, asr_topk)]:
+        try:
+            out = _transcribe_whisperx(audio_path, device_asr, device_align, batch_size, lg)
+            logs = [s.get('avg_logprob', -5.0) for s in out.get('segments', [])]
+            score = float(np.mean(logs)) if logs else -5.0
+            scored.append((score, out))
+        except Exception:
+            continue
+    if scored:
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored[0][1]
+    return _transcribe_whisperx(audio_path, device_asr, device_align, batch_size, None)
 
-    # 3) Align word‐level timestamps
-    print("▶ Aligning word‐level timestamps…")
-    align_model, metadata = whisperx.load_align_model(
-        language_code=result["language"], device=device_asr
-    )
-    aligned = whisperx.align(
-        result["segments"],
-        align_model,
-        metadata,
-        audio,
-        device_asr,
-        return_char_alignments=False,
-    )["segments"]
-    print(f"   → {len(aligned)} aligned segments")
+def main(argv: Optional[List[str]] = None) -> None:
+    ap = argparse.ArgumentParser('lingualign: N-language ASR+LID pipeline')
+    ap.add_argument('audio', help='Path to audio file')
+    ap.add_argument('-o','--outdir', default='results', help='Output directory')
+    ap.add_argument('-f','--formats', default='plain,md,srt', help='Comma-separated: plain,md,srt')
+    ap.add_argument('--sr', type=int, default=16000, help='LID audio sample rate')
+    ap.add_argument('--lexicon-dir', type=str, default='lexicons', help='Directory of <lang>.txt files')
+    ap.add_argument('--languages', type=str, default=None, help='Comma-separated whitelist, e.g. en,es,ar')
+    ap.add_argument('--lang-scope', type=str, default='intersection', choices=['any','asr','intersection'], help='Candidate set scope')
+    ap.add_argument('--highlight-langs', type=str, default=None, help='Comma-separated langs to emphasize in outputs')
+    ap.add_argument('--asr-language', type=str, default=None, help='Force Whisper language (skip candidate search)')
+    ap.add_argument('--lid-topk', type=int, default=2, help='(reserved for future segment-level redecoding)')
+    ap.add_argument('--asr-topk', type=int, default=2, help='Try top-K candidate languages with forced decoding')
+    ap.add_argument('--device-asr', type=str, default='cpu')
+    ap.add_argument('--device-align', type=str, default='cpu')
+    ap.add_argument('--batch-size', type=int, default=16)
+    ap.add_argument('--debug', action='store_true')
+    args = ap.parse_args(argv)
 
-    # 4) Speaker diarization
-    print("▶ Speaker diarization…")
-    diarizer = whisperx.diarize.DiarizationPipeline(device=device_asr)
-    turns = diarizer(audio)
-    dia   = whisperx.assign_word_speakers(turns, {"segments": aligned})
-    segments = dia["segments"]
+    audio_path = args.audio
+    outdir = Path(args.outdir)
 
-    # 4a) Re‐index raw speaker IDs into SPEAKER_00, SPEAKER_01, … in order seen
-    raw2canon = {}
-    for seg in segments:
-        raw = seg.get("speaker", "")
-        if raw not in raw2canon:
-            raw2canon[raw] = f"SPEAKER_{len(raw2canon):02d}"
-        canon = raw2canon[raw]
-        seg["speaker"] = canon
-        for w in seg["words"]:
-            # ensure every word carries the segment’s speaker
-            w["speaker"] = canon
+    caps = capabilities(include_runtime=True)
+    user_list = [normalize_lang(s) for s in args.languages.split(',')] if args.languages else None
 
-    # 4b) Map those SPEAKER_** into human roles via roles.json
-    roles_json = Path(__file__).parent.parent / "roles.json"
-    map_speakers_to_roles(segments, roles_json)
-    print("   → mapped speakers → human roles")
+    sb_model = None
+    if HAS_SPEECHBRAIN:
+        try:
+            sb_model = EncoderClassifier.from_hparams(
+                source='speechbrain/lang-id-voxlingua107-ecapa',
+                savedir='pretrained_models/lang-id-voxlingua107-ecapa',
+                run_opts={'device': args.device_asr},
+            )
+            try:
+                import numpy as _np
+                labels = sb_model.hparams.label_encoder.decode_ndim(_np.arange(sb_model.hparams.label_encoder.num_labels))
+                vox_codes = set(l.split(':',1)[0].strip().lower() for l in labels)
+                caps['lid'] = {normalize_lang(c) for c in vox_codes}
+            except Exception:
+                pass
+        except Exception:
+            sb_model = None
 
-    # 5) per-word Language ID
-    print("▶ Initializing SpeechBrain LID model on", device_lid)
-    sb = init_audio_lid(device=device_lid)
-    print("▶ Running per-word LID…")
-    annotated = annotate_segments_language(
-        segments,
-        audio,
-        sr=sr,
-        en_lex_path="lexicons/english.txt",
-        es_lex_path="lexicons/spanish.txt",
-        model=sb,
-        margin=margin,
-    )
-    print("   → LID complete")
+    candidates = effective_language_set(scope=args.lang_scope, user_whitelist=user_list, caps=caps, fallback_if_empty={'en'})
+    candidates = sorted(candidates)
 
-    # 6) Export into all requested formats
-    if "txt" in formats or "plain" in formats:
-        to_plain(annotated, audio_path, outdir)
-    if "md" in formats or "markdown" in formats:
-        to_markdown(annotated, audio_path, outdir)
-    if "srt" in formats:
-        to_srt(annotated, audio_path, outdir)
-    if "tex" in formats:
-        to_tex(annotated, audio_path, outdir, compile_pdf=compile_pdf)
+    if args.asr_language:
+        forced = normalize_lang(args.asr_language)
+        result = decode_with_language_candidates(audio_path, [forced], args.device_asr, args.device_align, args.batch_size, asr_topk=1)
+        chosen_langs = [forced]
+    else:
+        result = decode_with_language_candidates(audio_path, candidates, args.device_asr, args.device_align, args.batch_size, asr_topk=args.asr_topk)
+        chosen_langs = candidates
 
-    # 7) report elapsed time
-    elapsed = time.perf_counter() - t0
-    elapsed_str = str(datetime.timedelta(seconds=elapsed)).split(".")[0]
-    print(f"▶ Finished `{Path(audio_path).name}` in {elapsed_str}\n")
+    segments = result.get('segments', [])
+    audio_arr = _load_audio(audio_path, args.sr)
 
+    lid_cfg = LIDConfig(languages=chosen_langs, lexicon_dir=args.lexicon_dir, margin=0.75, fuzzy_cutoff=0.85, pad=0.1, sr=args.sr, debug=args.debug)
+    segments = annotate_segments_language(segments, audio_arr, sb_model, lid_cfg)
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Lingualign CLI — ASR → Align → Diarize → LID → export"
-    )
-    parser.add_argument(
-        "-f", "--formats",
-        nargs="+",
-        choices=["markdown", "md", "plain", "srt", "tex", "txt"],
-        required=True,
-        help="Which output formats to produce"
-    )
-    parser.add_argument(
-        "-o", "--output",
-        required=True,
-        help="Root folder under which each track gets its own subfolder"
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=16,
-        help="ASR batch size"
-    )
-    parser.add_argument(
-        "--device-asr", dest="device_asr", default="cpu",
-        help="Device for WhisperX (e.g. cuda or cpu)"
-    )
-    parser.add_argument(
-        "--device-lid", dest="device_lid", default="cpu",
-        help="Device for SpeechBrain LID"
-    )
-    parser.add_argument(
-        "--no-pdf", action="store_false", dest="compile_pdf",
-        help="Skip running pdflatex in tex"
-    )
-    parser.add_argument(
-        "--margin", type=float, default=0.75,
-        help="Text‐based LID cutoff; below this, fall back to audio"
-    )
-    parser.add_argument(
-        "audio_paths", nargs="+",
-        help="One or more audio files or directories to process"
-    )
+    fmts = [x.strip().lower() for x in args.formats.split(',') if x.strip()]
+    hl = [normalize_lang(x) for x in args.highlight_langs.split(',')] if args.highlight_langs else None
 
-    args = parser.parse_args()
+    if "plain" in fmts:
+        to_plain(segments, audio_path, outdir, highlight_langs=hl)
+    if "md" in fmts or "markdown" in fmts:
+        to_markdown(segments, audio_path, outdir, highlight_langs=hl)
+    if "srt" in fmts:
+        to_srt(segments, audio_path, outdir, highlight_langs=hl)
+    if "tex" in fmts:
+        to_tex(segments, audio_path, outdir, compile_pdf=False, title=Path(audio_path).stem, highlight_langs=hl)
 
-    # Expand any directories into their audio files
-    all_inputs = []
-    for p in args.audio_paths:
-        p = Path(p)
-        if p.is_dir():
-            for ext in ("mp3", "m4a", "wav", "mp4", "mov"):
-                all_inputs.extend(sorted(p.glob(f"*.{ext}")))
-        else:
-            all_inputs.append(p)
+    print(f"✓ Wrote outputs to {outdir.resolve()}")
 
-    # Process each in turn
-    for audio_file in all_inputs:
-        run_one(
-            str(audio_file),
-            args.output,
-            args.formats,
-            args.batch_size,
-            args.device_asr,
-            args.device_lid,
-            args.compile_pdf,
-            args.margin,
-        )
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
